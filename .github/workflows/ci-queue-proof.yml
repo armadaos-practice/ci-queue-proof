@@ -1,0 +1,80 @@
+name: ci-queue-proof
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+jobs:
+  plant:
+    name: Read planted fault
+    runs-on: ubuntu-24.04
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      extra_required: ${{ steps.mode.outputs.extra_required }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          mode=green
+          if [ -f .ci-queue-proof-mode ]; then mode=$(tr -d '\r\n' < .ci-queue-proof-mode); fi
+          case "$mode" in green|full-red|missing|cancelled|skipped) ;; *) echo "unsupported proof mode: $mode" >&2; exit 1 ;; esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          if [ "$mode" = missing ] && [ "$GITHUB_EVENT_NAME" = merge_group ]; then
+            echo 'extra_required=["removed-full-job"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'extra_required=[]' >> "$GITHUB_OUTPUT"
+          fi
+
+  cheap:
+    name: Cheap PR check
+    needs: [plant]
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "cheap check passed for $GITHUB_SHA"
+
+  full:
+    name: Full queue check
+    needs: [plant]
+    if: ${{ github.event_name == 'merge_group' && needs.plant.outputs.mode != 'skipped' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - shell: bash
+        env:
+          MODE: ${{ needs.plant.outputs.mode }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = cancelled ]; then
+            echo "planted cancellation: waiting to be cancelled from outside the run"
+            sleep 240
+          fi
+          sleep 2
+          if [ "$MODE" = full-red ]; then
+            echo "planted full-suite failure" >&2
+            exit 1
+          fi
+          echo "full queue check passed once for $GITHUB_SHA"
+
+  queue-gate:
+    name: Merge Queue Proof Gate (required)
+    needs: [plant, cheap, full]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - env:
+          GATE_EVENT: ${{ github.event_name }}
+          GATE_RESULTS: ${{ toJSON(needs) }}
+          GATE_EXTRA_REQUIRED: ${{ needs.plant.outputs.extra_required || '[]' }}
+        run: node .github/ci-queue-proof/gate.mjs
